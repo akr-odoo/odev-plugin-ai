@@ -18,7 +18,13 @@ Important caveats vs. bwrap:
 - A strict (deny default) allowlist for non-file primitives is impractical:
   Cocoa/Foundation apps deadlock silently on `mach_msg` to system daemons
   rather than failing fast. Non-file ops are therefore allowed broadly; the
-  security boundary is enforced via file-write* deny rules.
+  security boundary is enforced via file-write* deny rules, plus file-read*
+  deny rules on the user's secrets (`DENY_USER_SECRETS_RELATIVE`).
+- There is no remapping either: $HOME is the real home, so the sanitized copy
+  of odev's configuration the bwrap backend mounts cannot be substituted here.
+  `~/.config/odev/odev.cfg` stays readable and writable (odev rewrites it on
+  every start, it cannot run without); the rest of `~/.config/odev` is denied
+  but for the explicit binds inside it (odev's venv and plugins, read-only).
 """
 
 import contextlib
@@ -31,7 +37,13 @@ from pathlib import Path
 from odev.common.console import console
 from odev.common.logging import logging
 
-from .base import ExecutionSpec, Sandbox
+from .base import (
+    DENY_USER_SECRETS_RELATIVE,
+    ODEV_CONFIG_FILE_RELATIVE,
+    ExecutionSpec,
+    Sandbox,
+    secret_containing,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -67,27 +79,7 @@ DENY_SYSTEM_SUBPATHS: tuple[str, ...] = (
     "/opt",
 )
 
-#: Paths under $HOME that hold credentials, browsing history, or private
-#: communications. Resolved relative to the running user's home dir.
-#:
-#: NOTE: ~/Library/Keychains is INTENTIONALLY NOT here. macOS apps (claude,
-#: agy, …) authenticate to their LLM provider via Keychain; blocking
-#: writes silently breaks /login flows. The Keychain has its own per-app
-#: ACL system anyway.
-DENY_USER_SECRETS_RELATIVE: tuple[str, ...] = (
-    ".ssh",
-    ".aws",
-    ".gnupg",
-    ".docker",
-    ".kube",
-    ".netrc",
-    ".pypirc",
-    ".npmrc",
-    "Library/Cookies",
-    "Library/Mail",
-    "Library/Messages",
-    "Library/Safari",
-)
+# DENY_USER_SECRETS_RELATIVE (unreadable AND unwritable) is shared with bwrap: see base.py.
 
 #: Subpaths the agent ALWAYS gets RW access to, regardless of the spec.
 ALWAYS_RW_SUBPATHS: tuple[str, ...] = (
@@ -172,9 +164,11 @@ class SeatbeltSandbox(Sandbox):
         return (
             "On macOS, the Seatbelt backend uses a permissive baseline with targeted denies "
             "(matches Codex CLI's model). The agent CAN read your files and CAN write to "
-            "most of $HOME. The agent CANNOT write to: the OS, /Applications, /opt/homebrew, "
-            "~/.ssh, ~/.aws, ~/.gnupg, ~/.docker, ~/.kube, "
-            "~/Library/{Cookies,Mail,Messages,Safari}, or .netrc/.pypirc/.npmrc."
+            "most of $HOME. The agent CANNOT write to: the OS, /Applications, /opt/homebrew. "
+            "It can NEITHER READ NOR WRITE: ~/.ssh, ~/.aws, ~/.gnupg, ~/.docker, ~/.kube, "
+            "~/.config/{gh,odev} (but odev.cfg, which odev needs), ~/.password-store, "
+            "~/Library/{Cookies,Mail,Messages,Safari}, .netrc/.pypirc/.npmrc/.git-credentials/.pgpass, "
+            "or your shell startup files (.zshrc, .bashrc, .profile, …)."
         )
 
     # --- helpers -------------------------------------------------------------
@@ -266,6 +260,40 @@ class SeatbeltSandbox(Sandbox):
 
         return _expand_paths(rw_raw), _expand_paths(rw_literals)
 
+    def _collect_secret_exceptions(
+        self,
+        spec: ExecutionSpec,
+        host_home: Path,
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Compute what is given back inside the denied secrets: (metadata, read-only, read-write).
+
+        Only what was asked for by name: an explicit bind, agent dir or agent file that
+        lies inside a secret (odev's venv and plugins under ~/.config/odev, ~/.config/gh
+        for Copilot), and odev's own configuration file, which odev reads from the real
+        home and rewrites on every start. A bind of an ancestor gives nothing back.
+
+        The metadata of the secret directories leading to each of them is given back too:
+        `realpath()` stats every component, and the venv's python dies without it.
+        """
+        explicit: list[tuple[Path, bool]] = []
+        for src, dst, ro, _primary in spec.final_binds:
+            explicit.extend([(src, not ro), (dst, not ro)])
+        explicit.extend((d, True) for d in spec.agent_dirs)
+        explicit.extend((f, True) for f in spec.agent_files if f.exists())
+        explicit.append((host_home / ODEV_CONFIG_FILE_RELATIVE, True))
+
+        metadata: list[Path] = []
+        read_only: list[Path] = []
+        read_write: list[Path] = []
+        for path, writable in explicit:
+            secret = secret_containing(path, host_home)
+            if secret is None:
+                continue
+            (read_write if writable else read_only).append(path)
+            metadata.extend(parent for parent in path.parents if parent.is_relative_to(secret))
+
+        return _expand_paths(metadata), _expand_paths(read_only), _expand_paths(read_write)
+
     def _build_profile(
         self,
         spec: ExecutionSpec,
@@ -295,14 +323,24 @@ class SeatbeltSandbox(Sandbox):
         lines.extend(f"(deny file-write* (subpath {_sbpl_quote(p)}))" for p in deny_system)
 
         lines.append("")
-        lines.append(";; --- Block writes to user credentials & private comms -------")
-        lines.extend(f"(deny file-write* (subpath {_sbpl_quote(p)}))" for p in deny_secrets)
-
-        lines.append("")
         lines.append(";; --- Re-allow writes the agent legitimately needs -----------")
         lines.append(";; (these override the broader denies above for paths inside them)")
         lines.extend(f"(allow file-write* (literal {_sbpl_quote(lit)}))" for lit in rw_lit)
         lines.extend(f"(allow file-write* (subpath {_sbpl_quote(p)}))" for p in rw_subpaths)
+
+        lines.append("")
+        lines.append(";; --- Block reads AND writes of user secrets & private comms --")
+        lines.append(";; (after the re-allow above: a workspace that contains them, like")
+        lines.append(";; $HOME itself, must not give them back)")
+        lines.extend(f"(deny file-read* file-write* (subpath {_sbpl_quote(p)}))" for p in deny_secrets)
+
+        meta, secret_ro, secret_rw = self._collect_secret_exceptions(spec, host_home)
+        if meta or secret_ro or secret_rw:
+            lines.append("")
+            lines.append(";; --- Give back what was bound by name inside a secret ---------")
+            lines.extend(f"(allow file-read-metadata (literal {_sbpl_quote(p)}))" for p in meta)
+            lines.extend(f"(allow file-read* (subpath {_sbpl_quote(p)}))" for p in secret_ro)
+            lines.extend(f"(allow file-read* file-write* (subpath {_sbpl_quote(p)}))" for p in secret_rw)
 
         return "\n".join(lines) + "\n"
 

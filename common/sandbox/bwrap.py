@@ -17,7 +17,7 @@ from odev.common.browsers import Chrome
 from odev.common.console import console
 from odev.common.logging import logging
 
-from .base import ExecutionSpec, Sandbox
+from .base import DENY_USER_SECRETS_RELATIVE, ExecutionSpec, Sandbox
 
 
 logger = logging.getLogger(__name__)
@@ -281,6 +281,48 @@ class BwrapSandbox(Sandbox):
             ensure_dst(dst, is_dir=src.is_dir())
             cmd.extend(["--ro-bind-try" if ro else "--bind-try", str(src), str(dst)])
 
+    @staticmethod
+    def _mask_user_secrets(cmd: list[str], spec: ExecutionSpec, host_home: Path) -> None:
+        """Hide the real secrets that a bind of one of their ancestors brought into view.
+
+        $HOME is the playground, so none of `DENY_USER_SECRETS_RELATIVE` is visible by
+        default: odev's configuration is a sanitized copy, the rest does not exist. But a
+        workspace bind of $HOME itself (a dotfiles repository), of ~/.config, … mounts the
+        real ones back over it. Each is covered again, after all binds, with its playground
+        copy when there is one (odev's configuration) or with an empty tmpfs or /dev/null;
+        then the binds asked for by name inside it (odev's venv and plugins, ~/.config/gh
+        for Copilot) are mounted again on top.
+        """
+        explicit = [(src, dst, ro) for src, dst, ro, _primary in spec.final_binds]
+        explicit.extend((d, d, False) for d in spec.agent_dirs)
+        explicit.extend((f, f, False) for f in spec.agent_files if f.exists())
+
+        masked: list[Path] = []
+        for rel in DENY_USER_SECRETS_RELATIVE:
+            secret = host_home / rel
+            if not os.path.lexists(secret):
+                continue
+            real = secret.resolve()
+            for src, dst, _ro in explicit:
+                src_real = src.resolve()
+                if real == src_real or not real.is_relative_to(src_real):
+                    continue  # not exposed by this bind, or bound by name
+                guest = dst / real.relative_to(src_real)
+                if guest in masked:
+                    continue
+                masked.append(guest)
+                copy = spec.playground / rel
+                if copy.exists():
+                    cmd.extend(["--bind", str(copy), str(guest)])
+                elif real.is_dir():
+                    cmd.extend(["--tmpfs", str(guest)])
+                else:
+                    cmd.extend(["--ro-bind", "/dev/null", str(guest)])
+
+        for src, dst, ro in explicit:
+            if any(dst.is_relative_to(guest) for guest in masked):
+                cmd.extend(["--ro-bind-try" if ro else "--bind-try", str(src), str(dst)])
+
     def _add_postgres_socket_binds(self, cmd: list[str], proxy_dir: Path) -> None:
         """Expose the ephemeral PG socket dir at /var/run/postgresql + /tmp symlink."""
         cmd.extend(
@@ -296,7 +338,7 @@ class BwrapSandbox(Sandbox):
 
     # --- main entry ----------------------------------------------------------
 
-    def execute(self, spec: ExecutionSpec) -> bool:  # noqa: PLR0912 - sequential argv assembly, splitting it would obscure the isolation logic
+    def execute(self, spec: ExecutionSpec) -> bool:  # noqa: PLR0912,PLR0915 - sequential argv assembly, splitting it would obscure the isolation logic
         """Translate the spec into a bwrap argv and execute the agent."""
         host_home = Path.home().resolve()
 
@@ -359,6 +401,7 @@ class BwrapSandbox(Sandbox):
             self._add_postgres_socket_binds(cmd, spec.proxy_dir)
 
         self._apply_final_bindings(cmd, spec.agent_dirs, spec.agent_files, spec.final_binds, host_home, spec.playground)
+        self._mask_user_secrets(cmd, spec, host_home)
         self._prepare_agent_config(
             spec.playground,
             [str(dst) for src, dst, _, _ in spec.final_binds if src != host_home],

@@ -4,8 +4,10 @@ Holds platform-agnostic logic (bind resolution, agent config sanitization,
 warning rendering) and defines the contract that backends must implement.
 """
 
+import configparser
 import contextlib
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -27,6 +29,104 @@ from odev.common.version import OdooVersion
 
 
 logger = logging.getLogger(__name__)
+
+
+#: Paths under $HOME the agent must neither READ nor write: credentials, secret vaults,
+#: private communications, and the shell startup files (they export tokens, and whatever is
+#: written to them runs on the host at the next login). Resolved relative to the running
+#: user's home dir. Seatbelt denies them in the profile; bwrap never shows the real ones
+#: in the playground home it mounts over $HOME.
+#:
+#: Explicit binds that lie INSIDE one of them (e.g. odev's venv and plugins under
+#: ~/.config/odev, or ~/.config/gh for Copilot, which authenticates through it) are given
+#: back by both backends: they are needed, and were asked for by name. A bind of an
+#: ancestor (e.g. $HOME itself as the workspace) never re-exposes them.
+#:
+#: NOTE: ~/Library/Keychains is INTENTIONALLY NOT here. macOS apps (claude,
+#: agy, …) authenticate to their LLM provider via Keychain; blocking
+#: it silently breaks /login flows. The Keychain has its own per-app
+#: ACL system anyway.
+DENY_USER_SECRETS_RELATIVE: tuple[str, ...] = (
+    # Credentials
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".docker",
+    ".kube",
+    ".netrc",
+    ".pypirc",
+    ".npmrc",
+    ".git-credentials",
+    ".pgpass",
+    ".config/gh",
+    # Secret vaults: pass(1), and odev's configuration, vault key and plugins' data
+    ".password-store",
+    ".config/odev",
+    # Shell startup files
+    ".zshrc",
+    ".zshenv",
+    ".zprofile",
+    ".zlogin",
+    ".bashrc",
+    ".bash_profile",
+    ".profile",
+    # Private communications and browsing
+    "Library/Cookies",
+    "Library/Mail",
+    "Library/Messages",
+    "Library/Safari",
+)
+
+ODEV_CONFIG_FILE_RELATIVE = ".config/odev/odev.cfg"
+"""odev's own configuration file, relative to $HOME.
+
+odev reads it from the user's home and rewrites it on every start, so an odev run by the
+agent needs it readable *and* writable wherever $HOME is the real home (Seatbelt).
+"""
+
+SECRET_OPTION_PATTERN = re.compile(r"api_key|token|secret|passw", re.IGNORECASE)
+"""Configuration options dropped from the copies of odev's `.cfg` files given to the agent."""
+
+
+def write_sanitized_config(source: Path, target: Path) -> bool:
+    """Copy an INI configuration file without the options named like a credential.
+
+    Values are copied verbatim (no interpolation). A file that does not parse is not
+    copied at all rather than copied whole: odev recreates a missing one with defaults.
+
+    :return: Whether the copy was written.
+    """
+    parser = configparser.RawConfigParser()
+    parser.optionxform = str  # type: ignore[assignment] - keep the options' case as written
+    try:
+        parser.read(source)
+    except configparser.Error as e:
+        logger.debug(f"Not copying {source} into the sandbox, it does not parse: {e}")
+        return False
+
+    for section in parser.sections():
+        for option in parser.options(section):
+            if SECRET_OPTION_PATTERN.search(option):
+                parser.remove_option(section, option)
+
+    with target.open("w") as file:
+        parser.write(file)
+    target.chmod(0o600)
+    return True
+
+
+def secret_containing(path: Path, host_home: Path) -> Path | None:
+    """Return the entry of `DENY_USER_SECRETS_RELATIVE` that `path` is, or lies inside, if any.
+
+    Both the path as given and its resolved form are checked, against the secret as given
+    and resolved: binds are resolved, agent directories are not.
+    """
+    candidates = {path, path.resolve()}
+    for rel in DENY_USER_SECRETS_RELATIVE:
+        secret = host_home / rel
+        if any(c.is_relative_to(s) for c in candidates for s in {secret, secret.resolve()}):
+            return secret
+    return None
 
 
 @dataclass
@@ -290,13 +390,23 @@ class Sandbox(OdevFrameworkMixin, ABC):
         return True
 
     def _prepare_odev_config(self, playground: Path, host_home: Path) -> None:
-        """Create a sandboxed copy of the odev configuration."""
+        """Create a sandboxed copy of the odev configuration, without its secrets.
+
+        Only the files at the top of `~/.config/odev` are copied (not the plugins' data
+        directories), and the `.cfg` ones lose their credential-like options: the real
+        directory is in `DENY_USER_SECRETS_RELATIVE`, the copy is what odev finds instead
+        wherever the playground is the agent's $HOME (bwrap).
+        """
         config_dir = host_home / ".config" / "odev"
         if config_dir.exists():
             sandbox_config_dir = playground / ".config" / "odev"
             sandbox_config_dir.mkdir(parents=True, exist_ok=True)
             for f in config_dir.glob("*"):
-                if f.is_file():
+                if not f.is_file():
+                    continue
+                if f.suffix == ".cfg":
+                    write_sanitized_config(f, sandbox_config_dir / f.name)
+                else:
                     shutil.copy2(f, sandbox_config_dir / f.name)
 
     def _resolve_sandbox_dirs(self, sandbox_dirs: list[str]) -> list[tuple[Path, Path]]:
